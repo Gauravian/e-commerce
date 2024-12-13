@@ -41,6 +41,7 @@ export const registerUser = async (req, res) => {
 };
 
 // Endpoint to handle OTP verification and storing the user and cart data
+// Endpoint to handle OTP verification and storing the user and cart data
 export const verifyRegistrationOtp = async (req, res) => {
   try {
     const { otp, cartData } = req.body; // Receive cart data as well during OTP verification
@@ -64,50 +65,95 @@ export const verifyRegistrationOtp = async (req, res) => {
     }
 
     // Create the user after OTP verification
-    const user = await User.create({ 
-      name: otpRecord.name,  // Name is fetched from OTP model
-      email: otpRecord.email  // Email is fetched from OTP model
+    const user = await User.create({
+      name: otpRecord.name, // Name is fetched from OTP model
+      email: otpRecord.email, // Email is fetched from OTP model
     });
 
     // Generate JWT Token
     const token = jwt.sign({ id: user.id }, process.env.JWT_TOKEN, { expiresIn: '24h' });
 
+    // Initialize or update the cart
+    let cart = await Cart.findOne({ where: { userId: user.id } });
+    if (!cart) {
+      cart = await Cart.create({ userId: user.id });
+    }
+
     // Now process the cart data
     if (cartData && cartData.length > 0) {
-      let cart = await Cart.create({ userId: user.id }); // Create a new cart for the user
-
-      // Process each cart item
       for (const { productId, quantity } of cartData) {
         const product = await Product.findByPk(productId);
         if (product) {
           const totalPrice = product.price * quantity;
 
-          // Add items to the cart
-          await CartItem.create({
-            cartId: cart.id,
-            productId,
-            quantity,
-            totalPrice
-          });
+          // Check if the cart item already exists
+          let cartItem = await CartItem.findOne({ where: { cartId: cart.id, productId } });
+          if (cartItem) {
+            cartItem.quantity += quantity;
+            cartItem.totalPrice = cartItem.quantity * product.price;
+            await cartItem.save();
+          } else {
+            await CartItem.create({
+              cartId: cart.id,
+              productId,
+              quantity,
+              totalPrice,
+            });
+          }
         }
       }
     }
 
+    // Fetch updated cart details for response
+    const updatedCart = await Cart.findOne({
+      where: { userId: user.id },
+      include: [
+        {
+          model: CartItem,
+          as: 'cartItems',
+          include: [
+            {
+              model: Product,
+              as: 'product',
+              attributes: ['id', 'name', 'price', 'image'], // Include only required fields
+            },
+          ],
+        },
+      ],
+    });
+
     // Remove OTP after successful registration
     await Otp.destroy({ where: { otp } });
+
+    // Prepare the cart data for response
+    const cartResponse = updatedCart
+      ? updatedCart.cartItems.map((item) => ({
+          productId: item.product.id,
+          name: item.product.name,
+          price: item.product.price,
+          quantity: item.quantity,
+          totalPrice: item.totalPrice,
+          image: item.product.image,
+        }))
+      : [];
 
     // Respond with success message and user data
     res.status(201).json({
       message: 'User registered successfully',
-      user,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+      },
       token,
+      cart: cartResponse, // Include cart data in the response
     });
-
   } catch (error) {
     console.error('Error verifying OTP:', error.message);
     res.status(500).json({ error: error.message });
   }
 };
+
 
 
 export const loginUser = async (req, res) => {
@@ -125,27 +171,21 @@ export const loginUser = async (req, res) => {
 
     // Generate OTP for login
     const otp = crypto.randomInt(100000, 999999).toString();
-
-    // Set expiry time (5 minutes from now)
-    const expiresAt = new Date(new Date().getTime() + 5 * 60 * 1000); // 5 minutes
+    const expiresAt = new Date(new Date().getTime() + 5 * 60 * 1000); // 5 minutes expiry
 
     // Store OTP in the database
-    await Otp.create({
-      email,
-      otp,
-      expiresAt,
-    });
+    await Otp.create({ email, otp, expiresAt });
 
     // Send OTP to user's email
     await sendMail(email, 'Your OTP for Login', { otp });
 
-    // Step 1: Find or create a cart for the user if they have logged in (for storing cart data)
+    // Ensure cart exists for the user
     let cart = await Cart.findOne({ where: { userId: user.id } });
     if (!cart) {
       cart = await Cart.create({ userId: user.id });
     }
 
-    // Step 2: If cartData is provided, process it
+    // Process cartData if provided
     if (cartData && cartData.length > 0) {
       for (const { productId, quantity } of cartData) {
         const product = await Product.findByPk(productId);
@@ -155,15 +195,13 @@ export const loginUser = async (req, res) => {
 
         const totalPrice = product.price * quantity;
 
-        // Step 3: Check if the item already exists in the user's cart
+        // Update or create cart items
         let cartItem = await CartItem.findOne({ where: { cartId: cart.id, productId } });
         if (cartItem) {
-          // If the item exists, update its quantity and total price
           cartItem.quantity += quantity;
           cartItem.totalPrice = cartItem.quantity * product.price;
           await cartItem.save();
         } else {
-          // If the item doesn't exist, create a new cart item
           await CartItem.create({
             cartId: cart.id,
             productId,
@@ -174,11 +212,11 @@ export const loginUser = async (req, res) => {
       }
     }
 
+    // Return response
     res.status(200).json({
       message: 'OTP sent to email',
       token,
     });
-    
   } catch (error) {
     console.error('Error during login:', error.message);
     res.status(500).json({ error: error.message });
@@ -194,19 +232,18 @@ export const verifyOtp = async (req, res) => {
       return res.status(400).json({ message: 'OTP is required' });
     }
 
-    // Fetch OTP record from the database
+    // Fetch OTP record
     const otpRecord = await Otp.findOne({ where: { otp } });
     if (!otpRecord) {
       return res.status(400).json({ message: 'Invalid OTP' });
     }
 
-    // Check if OTP has expired
-    const currentTime = new Date();
-    if (currentTime > new Date(otpRecord.expiresAt)) {
+    // Check if OTP expired
+    if (new Date() > new Date(otpRecord.expiresAt)) {
       return res.status(400).json({ message: 'OTP has expired' });
     }
 
-    // Fetch user information along with their addresses
+    // Fetch user information
     const user = await User.findOne({
       where: { email: otpRecord.email },
       include: [
@@ -222,7 +259,7 @@ export const verifyOtp = async (req, res) => {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    // Fetch the user's cart data (bulk items)
+    // Fetch cart and items
     const cart = await Cart.findOne({
       where: { userId: user.id },
       include: [
@@ -233,14 +270,14 @@ export const verifyOtp = async (req, res) => {
             {
               model: Product,
               as: 'product',
-              attributes: ['id', 'name', 'price', 'description', 'image'], // Include more attributes as needed
+              attributes: ['id', 'name', 'price', 'description', 'image'], // Additional attributes if needed
             },
           ],
         },
       ],
     });
 
-    // Prepare cart data with bulk items or an empty array if no cart exists
+    // Format cart data
     const cartData = cart
       ? cart.cartItems.map((item) => ({
           productId: item.product.id,
@@ -248,14 +285,14 @@ export const verifyOtp = async (req, res) => {
           quantity: item.quantity,
           price: item.product.price,
           totalPrice: item.totalPrice,
-          imageUrl: item.product.imageUrl, // Assuming products have images
+          imageUrl: item.product.image || '', // Use default image if none
         }))
       : [];
 
-    // Remove OTP after successful verification
+    // Remove OTP
     await Otp.destroy({ where: { otp } });
 
-    // Return the response with user information, address, and cart data
+    // Send response
     res.status(200).json({
       message: 'Login successful',
       user: {
@@ -263,13 +300,14 @@ export const verifyOtp = async (req, res) => {
         email: user.email,
         addresses: user.addresses,
       },
-      cartData, // Include cart data (bulk items) in the response
+      cartData,
     });
   } catch (error) {
     console.error('Error verifying OTP:', error.message);
     res.status(500).json({ error: error.message });
   }
 };
+
 
 
 
